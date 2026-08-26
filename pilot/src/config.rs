@@ -24,6 +24,10 @@ const KNOWN_SETTINGS: &[&str] = &[
     "SPONSORED_EXECUTOR_ADDRESS",
     "SPONSORED_OPERATION_DEADLINE_SECONDS",
     "RPC_URL",
+    "RPC_URL_2",
+    "RPC_URL_3",
+    "RPC_URL_4",
+    "RPC_URL_5",
     "FEE_AUTOMATIC",
     "MAX_FEE_PER_GAS_GWEI",
     "MAX_PRIORITY_FEE_PER_GAS_GWEI",
@@ -39,6 +43,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "OPENSEA_MAX_ATTEMPTS",
     "OPENSEA_RETRY_INTERVAL_MS",
     "OPENSEA_CALLDATA_MAX_ATTEMPTS",
+    "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS",
 ];
 const GWEI_IN_WEI: u64 = 1_000_000_000;
 
@@ -77,7 +82,7 @@ pub struct AppConfig {
     pub scheduling: SchedulingConfig,
     pub retry: RetryConfig,
     pub fees: FeesConfig,
-    pub rpc_url: Url,
+    pub rpc_urls: Vec<Url>,
     pub gas_limit: u64,
 }
 
@@ -116,6 +121,9 @@ pub struct RetryConfig {
 pub struct FeesConfig {
     pub mode: FeeMode,
     pub replacement_bump_bps: u32,
+    /// BPS multiplier applied to maxPriorityFeePerGas at T-2 only.
+    /// 10000 = 1× (no boost). 20000 = 2×. Range: 10000-50000.
+    pub launch_priority_fee_multiplier_bps: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +143,7 @@ impl fmt::Debug for AppConfig {
             .field("scheduling", &self.scheduling)
             .field("retry", &self.retry)
             .field("fees", &self.fees)
-            .field("rpc_url", &"<redacted>")
+            .field("rpc_url_count", &self.rpc_urls.len())
             .field("gas_limit", &self.gas_limit)
             .finish()
     }
@@ -226,12 +234,27 @@ impl LoadedConfig {
     ) -> Result<Self, ConfigError> {
         validate_known_settings(&values)?;
         let (wallet_key, manifest_setting) = select_wallet_source(&mut values)?;
-        let rpc_url = parse_url(&take_required(&mut values, "RPC_URL")?, "RPC_URL")?;
-        if !is_allowed_rpc_url(&rpc_url) {
+        let primary_url = parse_url(&take_required(&mut values, "RPC_URL")?, "RPC_URL")?;
+        if !is_allowed_rpc_url(&primary_url) {
             return Err(invalid(
                 "RPC_URL",
                 "must use HTTPS, except for an HTTP loopback test endpoint",
             ));
+        }
+        let mut rpc_urls = vec![primary_url];
+        for key in ["RPC_URL_2", "RPC_URL_3", "RPC_URL_4", "RPC_URL_5"] {
+            if let Some(raw) = values.remove(key) {
+                if !raw.trim().is_empty() {
+                    let url = parse_url(&raw, "RPC_URL_N")?;
+                    if !is_allowed_rpc_url(&url) {
+                        return Err(invalid(
+                            "RPC_URL",
+                            "must use HTTPS, except for an HTTP loopback test endpoint",
+                        ));
+                    }
+                    rpc_urls.push(url);
+                }
+            }
         }
         let fees = parse_fees(&mut values)?;
 
@@ -280,7 +303,7 @@ impl LoadedConfig {
                 max_delay_ms: take_u64_default(&mut values, "RECEIPT_POLL_MAX_DELAY_MS", 2_000)?,
             },
             fees,
-            rpc_url,
+            rpc_urls,
             gas_limit,
         };
         config.validate()?;
@@ -426,9 +449,12 @@ fn parse_fees(values: &mut BTreeMap<String, String>) -> Result<FeesConfig, Confi
             )?,
         }
     };
+    let launch_priority_fee_multiplier_bps =
+        take_u32_default(values, "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS", 10_000)?;
     Ok(FeesConfig {
         mode,
         replacement_bump_bps,
+        launch_priority_fee_multiplier_bps,
     })
 }
 
@@ -456,6 +482,11 @@ impl fmt::Debug for DeploymentConfig {
 }
 
 impl AppConfig {
+    /// Returns the primary RPC endpoint (always the first, always present).
+    pub fn primary_rpc_url(&self) -> &Url {
+        &self.rpc_urls[0]
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_opensea()?;
         self.validate_scheduling()?;
@@ -478,6 +509,11 @@ impl AppConfig {
         if !(10_001..=20_000).contains(&self.fees.replacement_bump_bps) {
             return Err(ConfigError::Validation(
                 "REPLACEMENT_BUMP_BPS must be between 10001 and 20000".into(),
+            ));
+        }
+        if !(10_000..=50_000).contains(&self.fees.launch_priority_fee_multiplier_bps) {
+            return Err(ConfigError::Validation(
+                "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS must be between 10000 and 50000".into(),
             ));
         }
         match self.fees.mode {
@@ -1073,7 +1109,8 @@ mod tests {
                     .expect("executor")
             )
         );
-        assert_eq!(loaded.app.rpc_url.as_str(), "https://rpc.example/");
+        assert_eq!(loaded.app.rpc_urls[0].as_str(), "https://rpc.example/");
+        assert_eq!(loaded.app.rpc_urls.len(), 1);
         assert!(!format!("{loaded:?}").contains(KEY));
     }
 

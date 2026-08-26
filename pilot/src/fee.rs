@@ -51,6 +51,7 @@ mod tests {
         let config = FeesConfig {
             mode: FeeMode::Automatic,
             replacement_bump_bps: 11_250,
+            launch_priority_fee_multiplier_bps: 10_000,
         };
         let initial = initial_transaction_fees(
             config,
@@ -76,6 +77,7 @@ mod tests {
                 max_priority_fee_per_gas: U256::from(5_u64),
             },
             replacement_bump_bps: 11_250,
+            launch_priority_fee_multiplier_bps: 10_000,
         };
         let fees = initial_transaction_fees(
             config,

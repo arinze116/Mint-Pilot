@@ -564,7 +564,7 @@ async fn load_deployment_network(config: &AppConfig) -> Result<DeploymentNetwork
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
     let probe = logging::animate(
         "Checking configured deployment network",
-        gateway.probe_rpc(&config.rpc_url),
+        gateway.probe_any_rpc(&config.rpc_urls),
     )
     .await?;
     Ok(DeploymentNetwork {
@@ -801,7 +801,7 @@ async fn multi_wallet_doctor(
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
     let probe = logging::animate(
         "Checking RPC connection",
-        gateway.probe_rpc(&config.rpc_url),
+        gateway.probe_any_rpc(&config.rpc_urls),
     )
     .await?;
     let chain = derived_chain(config, probe.chain_id);
@@ -867,7 +867,7 @@ async fn doctor(
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
     let probe = logging::animate(
         "Checking RPC connection",
-        gateway.probe_rpc(&config.rpc_url),
+        gateway.probe_any_rpc(&config.rpc_urls),
     )
     .await?;
     let chain = derived_chain(config, probe.chain_id);
@@ -887,7 +887,7 @@ async fn mint(config: &AppConfig, signer: &WalletSigner) -> Result<(), CommandEr
     let locator = parse_collection_locator(&locator_text)?;
     logging::section_break();
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = logging::animate("Connecting to RPC", gateway.probe_rpc(&config.rpc_url)).await?;
+    let probe = logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = derived_chain(config, probe.chain_id);
     logging::success(format!("RPC connected: chain_id={}", chain.chain_id));
     let mut client = WalletOpenSeaClient::new(&config.opensea)?;
@@ -967,7 +967,7 @@ async fn mint(config: &AppConfig, signer: &WalletSigner) -> Result<(), CommandEr
 fn derived_chain(config: &AppConfig, chain_id: u64) -> ChainConfig {
     ChainConfig {
         chain_id,
-        rpc_urls: vec![config.rpc_url.clone()],
+        rpc_urls: config.rpc_urls.clone(),
     }
 }
 
@@ -2111,7 +2111,8 @@ async fn broadcast_signed_attempt(
 async fn broadcast_signed_transaction(
     gateway: &ChainGateway,
     chain: &ChainConfig,
-    rpc_index: usize,
+    _rpc_index: usize,
+
     signed_transaction: &SignedTransaction,
 ) -> Result<B256, CommandError> {
     let local_hash = signed_transaction.hash();
@@ -2120,7 +2121,7 @@ async fn broadcast_signed_transaction(
         .flush()
         .map_err(CommandError::SubmissionOutput)?;
     let transaction_hash = gateway
-        .send_raw_transaction(chain, rpc_index, signed_transaction)
+        .send_raw_transaction_fanout(chain, signed_transaction)
         .await
         .map_err(|_| CommandError::BroadcastOutcomeUncertain {
             transaction_hash: local_hash,
@@ -2856,8 +2857,9 @@ mod tests {
             fees: crate::config::FeesConfig {
                 mode,
                 replacement_bump_bps: 11_250,
+                launch_priority_fee_multiplier_bps: 10_000,
             },
-            rpc_url: "https://rpc.example.invalid".parse().expect("URL"),
+            rpc_urls: vec!["https://rpc.example.invalid".parse().expect("URL")],
             gas_limit: 300_000,
         }
     }

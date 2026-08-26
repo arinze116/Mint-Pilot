@@ -285,6 +285,7 @@ impl fmt::Debug for MintTransactionAction {
     }
 }
 
+#[derive(Clone)]
 pub struct WalletOpenSeaClient {
     client: Client,
     cookie_jar: Arc<Jar>,
@@ -789,6 +790,7 @@ fn is_retryable_request_error(error: &OpenSeaError) -> bool {
         error,
         OpenSeaError::Transport
             | OpenSeaError::RateLimited
+            | OpenSeaError::MintWalletIneligible
             | OpenSeaError::Authentication(408 | 409 | 425 | 429 | 500..=599)
             | OpenSeaError::Http(408 | 409 | 425 | 429 | 500..=599)
     )

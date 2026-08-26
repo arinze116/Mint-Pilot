@@ -843,7 +843,7 @@ async fn submit_transfer(
             "Submitting transaction: {local_hash} (attempt {attempt}/{DIRECT_TRANSFER_MAX_ATTEMPTS})."
         ));
         match gateway
-            .send_raw_transaction(chain, rpc_index, &signed_transaction)
+            .send_raw_transaction_fanout(chain, &signed_transaction)
             .await
         {
             Ok(hash) if hash == local_hash => {
@@ -917,10 +917,10 @@ async fn connect(
     config: &AppConfig,
 ) -> Result<(ChainGateway, ChainConfig, usize), NativeFundsError> {
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = rpc_read_retry(config, || gateway.probe_rpc(&config.rpc_url)).await?;
+let probe = rpc_read_retry(config, || gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = ChainConfig {
         chain_id: probe.chain_id,
-        rpc_urls: vec![config.rpc_url.clone()],
+rpc_urls: config.rpc_urls.clone(),
     };
     logging::success(format!("RPC connected: chain_id={}", chain.chain_id));
     Ok((gateway, chain, probe.rpc_index))
@@ -1438,7 +1438,7 @@ mod tests {
                 mode: crate::config::FeeMode::Automatic,
                 replacement_bump_bps: 11_250,
             },
-            rpc_url: "https://rpc.example.invalid".parse().expect("RPC URL"),
+            rpc_urls: vec!["https://rpc.example.invalid".parse().expect("RPC URL")],
             gas_limit: 300_000,
         }
     }

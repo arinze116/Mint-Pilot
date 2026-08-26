@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::{ChainConfig, RetryConfig},
+    logging,
     transaction::SignedTransaction,
 };
 
@@ -77,6 +78,31 @@ impl ChainGateway {
         Ok(Self { client })
     }
 
+    /// Probes all configured RPC URLs in order and returns the first successful
+    /// result. Falls back to subsequent URLs if the primary is unavailable at
+    /// startup, so the bot survives a single provider outage.
+    pub async fn probe_any_rpc(&self, rpc_urls: &[Url]) -> Result<ChainProbe, ChainError> {
+        let mut last_error = ChainError::InvalidResponse { index: 1 };
+        for (i, url) in rpc_urls.iter().enumerate() {
+            match self.probe_rpc(url).await {
+                Ok(probe) => {
+                    if i > 0 {
+                        logging::warn(format!(
+                            "Primary RPC failed at startup; using fallback RPC {}.",
+                            i + 1
+                        ));
+                    }
+                    return Ok(probe);
+                }
+                Err(e) => {
+                    logging::warn(format!("RPC {} startup probe failed: {e}.", i + 1));
+                    last_error = e;
+                }
+            }
+        }
+        Err(last_error)
+    }
+
     pub async fn probe_rpc(&self, rpc_url: &Url) -> Result<ChainProbe, ChainError> {
         let chain_id = self
             .request::<String>(rpc_url, 1, "eth_chainId", Value::Array(vec![]))
@@ -87,9 +113,32 @@ impl ChainGateway {
         if chain_id == 0 {
             return Err(ChainError::InvalidResponse { index: 1 });
         }
+        let clock_offset_ms = {
+            let local_before = system_time_ms();
+            let block_result = self
+                .request::<RpcBlock>(
+                    rpc_url,
+                    1,
+                    "eth_getBlockByNumber",
+                    json!(["latest", false]),
+                )
+                .await;
+            let local_after = system_time_ms();
+            match block_result {
+                Ok(block) => match parse_quantity_u64(&block.timestamp) {
+                    Ok(chain_s) => {
+                        let local_mid = local_before.saturating_add(local_after) / 2;
+                        local_mid as i64 - (chain_s as i64).saturating_mul(1_000)
+                    }
+                    Err(_) => 0,
+                },
+                Err(_) => 0,
+            }
+        };
         Ok(ChainProbe {
             chain_id,
             rpc_index: 1,
+            clock_offset_ms,
         })
     }
 
@@ -384,6 +433,81 @@ impl ChainGateway {
         Ok(returned_hash)
     }
 
+    /// Broadcasts the same signed transaction to every configured RPC endpoint
+    /// concurrently. Returns as soon as any one endpoint accepts it. If only
+    /// one endpoint is configured the call is equivalent to send_raw_transaction.
+    pub async fn send_raw_transaction_fanout(
+        &self,
+        config: &ChainConfig,
+        signed: &SignedTransaction,
+    ) -> Result<B256, ChainError> {
+        let expected_hash = signed.hash();
+        let encoded: std::sync::Arc<str> =
+            format!("0x{}", hex::encode(signed.raw())).into();
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, url) in config.rpc_urls.iter().cloned().enumerate() {
+            let client = self.client.clone();
+            let encoded = std::sync::Arc::clone(&encoded);
+            let rpc_index = i + 1;
+            tasks.spawn(async move {
+                let response = client
+                    .post(url)
+                    .json(&JsonRpcRequest {
+                        jsonrpc: "2.0",
+                        id: 1,
+                        method: "eth_sendRawTransaction",
+                        params: json!([encoded.as_ref()]),
+                    })
+                    .send()
+                    .await
+                    .map_err(|_| ChainError::InvalidResponse { index: rpc_index })?;
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(ChainError::RateLimited { index: rpc_index });
+                }
+                if !response.status().is_success() {
+                    return Err(ChainError::InvalidResponse { index: rpc_index });
+                }
+                if response
+                    .content_length()
+                    .is_some_and(|len| len > RPC_CONTENT_LENGTH_LIMIT)
+                {
+                    return Err(ChainError::InvalidResponse { index: rpc_index });
+                }
+                let body = read_limited_body(response, RPC_RESPONSE_LIMIT)
+                    .await
+                    .map_err(|()| ChainError::InvalidResponse { index: rpc_index })?;
+                let envelope: serde_json::Value = serde_json::from_slice(&body)
+                    .map_err(|_| ChainError::InvalidResponse { index: rpc_index })?;
+                let result = extract_result(&envelope, rpc_index, 1)?;
+                let returned_hash: String = serde_json::from_value(result.clone())
+                    .map_err(|_| ChainError::InvalidResponse { index: rpc_index })?;
+                let returned_hash: B256 = returned_hash
+                    .parse()
+                    .map_err(|_| ChainError::InvalidResponse { index: rpc_index })?;
+                if returned_hash != expected_hash {
+                    return Err(ChainError::TransactionHashMismatch);
+                }
+                Ok::<B256, ChainError>(returned_hash)
+            });
+        }
+        let mut first_error: Option<ChainError> = None;
+        while let Some(outcome) = tasks.join_next().await {
+            match outcome {
+                Ok(Ok(hash)) => {
+                    tasks.abort_all();
+                    return Ok(hash);
+                }
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        Err(first_error.unwrap_or(ChainError::InvalidResponse { index: 1 }))
+    }
+
     pub async fn transaction_receipt(
         &self,
         config: &ChainConfig,
@@ -420,10 +544,16 @@ impl ChainGateway {
         let mut delay_ms = policy.initial_delay_ms.max(50);
         let mut received_response = false;
         let mut last_rate_limit = None;
+        let rpc_count = config.rpc_urls.len();
+        let mut poll_cycle: usize = 0;
         loop {
             for (index, transaction_hash) in transaction_hashes.iter().enumerate() {
+                // Rotate across all configured RPCs on each poll so a slow or
+                // rate-limited primary doesn't delay confirmation detection.
+                let poll_rpc = (poll_cycle % rpc_count) + 1;
+                poll_cycle = poll_cycle.wrapping_add(1);
                 match self
-                    .transaction_receipt(config, rpc_index, *transaction_hash)
+                    .transaction_receipt(config, poll_rpc, *transaction_hash)
                     .await
                 {
                     Ok(Some(receipt)) => return Ok(Some((index, receipt))),
@@ -431,6 +561,7 @@ impl ChainGateway {
                     Err(error @ ChainError::RateLimited { .. }) => {
                         last_rate_limit = Some(error);
                     }
+                    Err(ChainError::EndpointNotConfigured { .. }) => {}
                     Err(error) => return Err(error),
                 }
             }
@@ -439,7 +570,8 @@ impl ChainGateway {
                 return if received_response {
                     Ok(None)
                 } else {
-                    Err(last_rate_limit.unwrap_or(ChainError::InvalidResponse { index: rpc_index }))
+                    Err(last_rate_limit
+                        .unwrap_or(ChainError::InvalidResponse { index: rpc_index }))
                 };
             }
             sleep(Duration::from_millis(delay_ms).min(deadline - now)).await;
@@ -500,6 +632,13 @@ impl ChainGateway {
         let result = extract_result(&envelope, index, id)?;
         serde_json::from_value(result.clone()).map_err(|_| ChainError::InvalidResponse { index })
     }
+}
+
+fn system_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn eip7702_probe_params() -> Value {
@@ -572,6 +711,7 @@ impl fmt::Debug for ChainGateway {
 pub struct ChainProbe {
     pub chain_id: u64,
     pub rpc_index: usize,
+    pub clock_offset_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -740,7 +880,6 @@ fn decode_submission_batch(envelope: &Value, index: usize) -> Result<SubmissionI
         }
         results[slot] = Some(extract_result(response, index, id)?.clone());
     }
-
     let block: RpcBlock = serde_json::from_value(
         results[0]
             .take()
@@ -776,7 +915,6 @@ fn decode_submission_batch(envelope: &Value, index: usize) -> Result<SubmissionI
         .checked_mul(U256::from(2_u8))
         .and_then(|value| value.checked_add(max_priority_fee_per_gas))
         .ok_or(ChainError::QuantityOverflow)?;
-
     Ok(SubmissionInputs {
         latest_block: LatestBlock {
             timestamp,
@@ -808,7 +946,6 @@ fn decode_account_state_batch(envelope: &Value, index: usize) -> Result<AccountS
         }
         results[slot] = Some(extract_result(response, index, id)?.clone());
     }
-
     let balance: String = serde_json::from_value(
         results[0]
             .take()

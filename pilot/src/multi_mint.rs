@@ -186,6 +186,10 @@ struct MultiRunContext<'a> {
     gateway: &'a ChainGateway,
     chain: &'a ChainConfig,
     rpc_index: usize,
+    /// Signed ms difference between local clock and chain block time at
+    /// startup (local − chain). Applied to hot-path sleeps so the bot fires
+    /// relative to chain time, not the system clock.
+    clock_offset_ms: i64,
     resolver: &'a WalletOpenSeaClient,
     concurrency: usize,
 }
@@ -218,10 +222,10 @@ pub async fn run(
     let locator_text = terminal::prompt_collection_locator()?;
     let locator = parse_collection_locator(&locator_text)?;
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = logging::animate("Connecting to RPC", gateway.probe_rpc(&config.rpc_url)).await?;
+    let probe = logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = ChainConfig {
         chain_id: probe.chain_id,
-        rpc_urls: vec![config.rpc_url.clone()],
+        rpc_urls: config.rpc_urls.clone(),
     };
     logging::success(format!("RPC connected: chain_id={}", chain.chain_id));
 
@@ -280,6 +284,13 @@ pub async fn run(
         });
     }
     sort_scheduled_phases(&mut scheduled);
+    logging::info(format!(
+        "Clock offset vs chain: {} ms ({}).",
+        probe.clock_offset_ms,
+        if probe.clock_offset_ms > 0 { "local ahead" }
+        else if probe.clock_offset_ms < 0 { "local behind" }
+        else { "aligned" }
+    ));
     let context = MultiRunContext {
         config,
         multi,
@@ -287,6 +298,7 @@ pub async fn run(
         gateway: &gateway,
         chain: &chain,
         rpc_index: probe.rpc_index,
+        clock_offset_ms: probe.clock_offset_ms,
         resolver: &resolver,
         concurrency,
     };
@@ -453,15 +465,24 @@ async fn execute_multi_phase(
         metadata,
         selected_stage,
         wake_lead,
+        context.clock_offset_ms,
     )
     .await?;
+    // Fix 3: prefer chain block timestamp over wall clock so stage activation
+    // is checked against ground truth, not the local system clock.
+    let chain_timestamp = context
+        .gateway
+        .latest_block(context.chain, context.rpc_index)
+        .await
+        .map(|block| block.timestamp)
+        .unwrap_or_else(|_| unix_timestamp().unwrap_or(0));
     validate_unique_active_stage(
         &refreshed,
         &selected_stage,
         token_id,
         stage_window(&selected_stage)?
             .starts_at()
-            .max(unix_timestamp()?),
+            .max(chain_timestamp),
     )?;
     let mut candidates = prepare_action_candidates(
         context.gateway,
@@ -513,7 +534,7 @@ async fn execute_multi_phase(
         ),
         _ => None,
     };
-    wait_for_calldata_hot_path(&selected_stage).await?;
+    wait_for_calldata_hot_path(&selected_stage, context.clock_offset_ms).await?;
     let actions = fetch_actions_hot(
         context.config,
         &refreshed,
@@ -523,6 +544,17 @@ async fn execute_multi_phase(
         context.chain.chain_id,
     )
     .await?;
+    // Fix 2: fees were captured at T-10; refresh them with a live RPC call
+    // immediately before signing so the first transaction bids the current
+    // market rate, not a stale estimate.
+    let actions = refresh_hot_fees(
+        context.gateway,
+        context.chain,
+        context.rpc_index,
+        context.config.fees.launch_priority_fee_multiplier_bps,
+        actions,
+    )
+    .await;
     match &context.multi.mode {
         MultiWalletMode::SelfFunded => {
             run_self_funded(
@@ -568,10 +600,10 @@ pub async fn inspect_calldata(
     let manifest = WalletManifest::load(manifest_path)?;
     let locator = parse_collection_locator(locator_text)?;
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = logging::animate("Connecting to RPC", gateway.probe_rpc(&config.rpc_url)).await?;
+    let probe = logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = ChainConfig {
         chain_id: probe.chain_id,
-        rpc_urls: vec![config.rpc_url.clone()],
+        rpc_urls: config.rpc_urls.clone(),
     };
     let resolver = WalletOpenSeaClient::new(&config.opensea)?;
     let metadata = resolver
@@ -1245,7 +1277,9 @@ async fn fetch_actions_hot(
             quantity: candidate.session.entry.quantity(),
         })
         .collect::<Vec<_>>();
-    let client = &candidates[0].session.client;
+    // Pre-extract expected values so tasks can validate without borrowing candidates.
+    let expected_values: Vec<Option<alloy_primitives::U256>> =
+        candidates.iter().map(|c| c.expected_mint_value).collect();
     for attempt in 1..=config.opensea.calldata_max_attempts {
         if stage_window(stage)?
             .ends_at()
@@ -1253,56 +1287,87 @@ async fn fetch_actions_hot(
         {
             return Err(MultiMintError::StageEnded);
         }
-        let actions = client
-            .mint_transaction_actions(metadata, stage, &requests, chain_id)
-            .await
-            .and_then(|actions| {
-                if candidates.iter().zip(&actions).any(|(candidate, action)| {
-                    candidate
-                        .expected_mint_value
-                        .is_some_and(|expected| action.value != expected)
-                }) {
-                    Err(OpenSeaError::UnsafeMintAction {
-                        reason: "transaction value differs from the captured eligible price",
+        // Fire every wallet's authenticated session concurrently.
+        // If session[0] is rate-limited or stale at T+0, session[1] or
+        // session[2] can still succeed in the same attempt window.
+        let mut tasks: tokio::task::JoinSet<Result<Vec<MintTransactionAction>, OpenSeaError>> =
+            tokio::task::JoinSet::new();
+        for candidate in &candidates {
+            let client = candidate.session.client.clone();
+            let metadata_c = metadata.clone();
+            let stage_c = stage.clone();
+            let requests_c = requests.clone();
+            let expected_c = expected_values.clone();
+            tasks.spawn(async move {
+                client
+                    .mint_transaction_actions(&metadata_c, &stage_c, &requests_c, chain_id)
+                    .await
+                    .and_then(|actions| {
+                        if expected_c.iter().zip(&actions).any(|(expected, action)| {
+                            expected.is_some_and(|v| action.value != v)
+                        }) {
+                            Err(OpenSeaError::UnsafeMintAction {
+                                reason: "transaction value differs from the captured eligible price",
+                            })
+                        } else {
+                            Ok(actions)
+                        }
                     })
-                } else {
-                    Ok(actions)
-                }
             });
-        match actions {
-            Ok(actions) => {
-                logging::success(format!(
-                    "Fetched and validated {} wallet-specific mint action(s) in one OpenSea GraphQL request.",
-                    actions.len()
-                ));
-                return Ok(candidates
-                    .into_iter()
-                    .zip(actions)
-                    .map(|(candidate, action)| ActionWallet {
-                        entry: candidate.session.entry,
-                        action,
-                        account_state: candidate.account_state,
-                        fee_estimate: candidate.fee_estimate,
-                    })
-                    .collect());
+        }
+        let mut last_retryable: Option<OpenSeaError> = None;
+        let mut hard_error: Option<OpenSeaError> = None;
+        'drain: while let Some(outcome) = tasks.join_next().await {
+            if let Ok(result) = outcome {
+                match result {
+                    Ok(actions) => {
+                        tasks.abort_all();
+                        logging::success(format!(
+                            "Fetched and validated {} wallet-specific mint action(s) in one OpenSea GraphQL request.",
+                            actions.len()
+                        ));
+                        return Ok(candidates
+                            .into_iter()
+                            .zip(actions)
+                            .map(|(candidate, action)| ActionWallet {
+                                entry: candidate.session.entry,
+                                action,
+                                account_state: candidate.account_state,
+                                fee_estimate: candidate.fee_estimate,
+                            })
+                            .collect());
+                    }
+                    Err(e) if retryable_action_error(&e) => {
+                        last_retryable = Some(e);
+                    }
+                    Err(e) => {
+                        // Non-retryable error from any session — abort the rest
+                        // immediately; retrying a hard failure wastes the window.
+                        tasks.abort_all();
+                        hard_error = Some(e);
+                        break 'drain;
+                    }
+                }
             }
-            Err(error)
-                if retryable_action_error(&error)
-                    && attempt < config.opensea.calldata_max_attempts =>
-            {
-                logging::warn(format!(
-                    "OpenSea batch calldata attempt {attempt}/{} is not ready ({error}); retrying in {} ms.",
-                    config.opensea.calldata_max_attempts, config.opensea.retry_interval_ms
-                ));
-                sleep(Duration::from_millis(config.opensea.retry_interval_ms)).await;
-            }
-            Err(error) if retryable_action_error(&error) => {
-                return Err(MultiMintError::CalldataRetriesExhausted {
-                    attempts: config.opensea.calldata_max_attempts,
-                    last_error: error.to_string(),
-                });
-            }
-            Err(error) => return Err(error.into()),
+        }
+        if let Some(error) = hard_error {
+            return Err(error.into());
+        }
+        // All sessions returned retryable errors this attempt.
+        let error = last_retryable.unwrap_or(OpenSeaError::Compatibility);
+        if attempt < config.opensea.calldata_max_attempts {
+            logging::warn(format!(
+                "OpenSea batch calldata attempt {attempt}/{} — all {} session(s) not ready ({error}); retrying in {} ms.",
+                config.opensea.calldata_max_attempts,
+                candidates.len(),
+                config.opensea.retry_interval_ms
+            ));
+            sleep(Duration::from_millis(config.opensea.retry_interval_ms)).await;
+        } else {
+            return Err(MultiMintError::CalldataRetriesExhausted {
+                attempts: config.opensea.calldata_max_attempts,
+                last_error: error.to_string(),
+            });
         }
     }
     unreachable!("bounded batch calldata retry loop always returns")
@@ -1530,7 +1595,7 @@ async fn submit_eip1559_with_replacements(
             "Submitting transaction: {last_hash} (attempt {attempt})."
         ));
         gateway
-            .send_raw_transaction(chain, rpc_index, &signed_transaction)
+            .send_raw_transaction_fanout(chain, &signed_transaction)
             .await
             .map_err(|_| MultiMintError::BroadcastUncertain(last_hash))?;
         submitted.push(last_hash);
@@ -1711,12 +1776,21 @@ fn unix_timestamp_millis() -> Result<u64, MultiMintError> {
     u64::try_from(millis).map_err(|_| MultiMintError::StageChanged)
 }
 
+/// Returns the local millisecond timestamp adjusted by the measured clock
+/// offset so hot-path sleeps align with chain time rather than wall clock.
+/// `offset_ms` is positive when the local clock is ahead of chain time.
+fn adjusted_unix_timestamp_millis(offset_ms: i64) -> Result<u64, MultiMintError> {
+    let raw = unix_timestamp_millis()? as i64;
+    u64::try_from(raw.saturating_sub(offset_ms)).map_err(|_| MultiMintError::StageChanged)
+}
+
 async fn wait_for_launch_wake(
     config: &AppConfig,
     client: &WalletOpenSeaClient,
     original: &CollectionMetadata,
     selected: &StageMetadata,
     wake_lead_seconds: u64,
+    clock_offset_ms: i64,
 ) -> Result<(CollectionMetadata, StageMetadata), MultiMintError> {
     let mut stage = selected.clone();
     loop {
@@ -1729,7 +1803,7 @@ async fn wait_for_launch_wake(
             .checked_mul(1_000)
             .map(|starts_at| starts_at.saturating_sub(wake_lead_seconds.saturating_mul(1_000)))
             .ok_or(MultiMintError::ArithmeticOverflow)?;
-        let now_ms = unix_timestamp_millis()?;
+        let now_ms = adjusted_unix_timestamp_millis(clock_offset_ms)?;
         if now_ms >= wake_at_ms {
             let refreshed = client.collection_metadata(&original.slug).await?;
             if !same_collection(original, &refreshed) {
@@ -1764,19 +1838,70 @@ async fn wait_for_launch_wake(
     }
 }
 
-async fn wait_for_calldata_hot_path(stage: &StageMetadata) -> Result<(), MultiMintError> {
+async fn wait_for_calldata_hot_path(
+    stage: &StageMetadata,
+    clock_offset_ms: i64,
+) -> Result<(), MultiMintError> {
     let hot_at_ms = stage_window(stage)?
         .starts_at()
         .checked_mul(1_000)
         .map(|starts_at| starts_at.saturating_sub(CALLDATA_HOT_LEAD_MS))
         .ok_or(MultiMintError::ArithmeticOverflow)?;
     loop {
-        let remaining = hot_at_ms.saturating_sub(unix_timestamp_millis()?);
+        let remaining = hot_at_ms.saturating_sub(adjusted_unix_timestamp_millis(clock_offset_ms)?);
         if remaining == 0 {
             return Ok(());
         }
         sleep(Duration::from_millis(remaining)).await;
     }
+}
+
+/// Fetches a fresh fee estimate from the chain immediately before signing.
+/// Non-fatal: if the RPC call fails the pre-captured estimate is kept so the
+/// bot still submits rather than aborting at the worst possible moment.
+async fn refresh_hot_fees(
+    gateway: &ChainGateway,
+    chain: &ChainConfig,
+    rpc_index: usize,
+    launch_priority_multiplier_bps: u32,
+    mut actions: Vec<ActionWallet>,
+) -> Vec<ActionWallet> {
+    if actions.is_empty() {
+        return actions;
+    }
+    let address = actions[0].entry.address();
+    match gateway.submission_inputs(chain, rpc_index, address).await {
+        Ok(inputs) => {
+            let mut fresh = inputs.fee_estimate;
+            // Apply launch-time priority fee aggression if configured.
+            if launch_priority_multiplier_bps > 10_000 {
+                let boosted_priority = fresh
+                    .max_priority_fee_per_gas
+                    .saturating_mul(alloy_primitives::U256::from(
+                        launch_priority_multiplier_bps,
+                    ))
+                    / alloy_primitives::U256::from(10_000_u32);
+                let priority_increase =
+                    boosted_priority.saturating_sub(fresh.max_priority_fee_per_gas);
+                fresh.max_priority_fee_per_gas = boosted_priority;
+                fresh.max_fee_per_gas =
+                    fresh.max_fee_per_gas.saturating_add(priority_increase);
+            }
+            for action in &mut actions {
+                action.fee_estimate = fresh;
+            }
+            logging::info(format!(
+                "Hot-path fee refresh: max_priority={} max_fee={} (wei).",
+                fresh.max_priority_fee_per_gas, fresh.max_fee_per_gas
+            ));
+        }
+        Err(error) => {
+            logging::warn(format!(
+                "Hot-path fee refresh failed ({error}); using pre-captured estimates."
+            ));
+        }
+    }
+    actions
 }
 
 fn retryable_action_error(error: &OpenSeaError) -> bool {
@@ -1786,6 +1911,8 @@ fn retryable_action_error(error: &OpenSeaError) -> bool {
             | OpenSeaError::RateLimited
             | OpenSeaError::Compatibility
             | OpenSeaError::MintStageNotOpen
+            | OpenSeaError::MintWalletIneligible
+            | OpenSeaError::MintLimitExceeded
             | OpenSeaError::MintActionRejected
             | OpenSeaError::InvalidProtocolValue
             | OpenSeaError::UnsafeMintAction { .. }
@@ -2167,10 +2294,10 @@ pub async fn undelegate(
     )?;
     let manifest = WalletManifest::load(&multi.manifest_path)?;
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = gateway.probe_rpc(&config.rpc_url).await?;
+    let probe = gateway.probe_any_rpc(&config.rpc_urls).await?;
     let chain = ChainConfig {
         chain_id: probe.chain_id,
-        rpc_urls: vec![config.rpc_url.clone()],
+        rpc_urls: config.rpc_urls.clone(),
     };
     if !gateway.eip7702_is_live(&chain, probe.rpc_index).await? {
         return Err(MultiMintError::Eip7702Unavailable(chain.chain_id));
@@ -2441,7 +2568,7 @@ async fn submit_outer(
 ) -> Result<TransactionReceipt, MultiMintError> {
     let hash = signed.hash();
     gateway
-        .send_raw_transaction(chain, rpc_index, signed)
+        .send_raw_transaction_fanout(chain, signed)
         .await
         .map_err(|_| MultiMintError::BroadcastUncertain(hash))?;
     gateway
