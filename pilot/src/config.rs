@@ -44,6 +44,8 @@ const KNOWN_SETTINGS: &[&str] = &[
     "OPENSEA_RETRY_INTERVAL_MS",
     "OPENSEA_CALLDATA_MAX_ATTEMPTS",
     "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
 ];
 const GWEI_IN_WEI: u64 = 1_000_000_000;
 
@@ -450,7 +452,7 @@ fn parse_fees(values: &mut BTreeMap<String, String>) -> Result<FeesConfig, Confi
         }
     };
     let launch_priority_fee_multiplier_bps =
-        take_u32_default(values, "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS", 10_000)?;
+                take_u32_default(values, "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS", 10_000)?;
     Ok(FeesConfig {
         mode,
         replacement_bump_bps,

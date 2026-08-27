@@ -1247,7 +1247,13 @@ async fn prepare_action_candidates(
             Err(error @ (OpenSeaError::Compatibility | OpenSeaError::UnsafeMintAction { .. })) => {
                 return Err(error.into());
             }
-            Err(error) => logging::warn(format!("Wallet skipped while preparing mint: {error}")),
+            Err(error) => {
+                let reason = format!("{error}");
+                logging::warn(format!("Wallet skipped while preparing mint: {reason}"));
+                crate::telegram::TelegramNotifier::from_env()
+                    .notify_skipped("wallet", &reason)
+                    .await;
+            }
         }
     }
     candidates.sort_by_key(|(manifest_index, _)| *manifest_index);
@@ -1460,13 +1466,20 @@ async fn run_self_funded(
     while let Some(result) = tasks.join_next().await {
         match result.map_err(|_| MultiMintError::Worker)? {
             Ok(address) => {
-                succeeded += 1;
-                logging::success(format!("Wallet mint and forwarding completed: {address}"));
-            }
-            Err(error) => {
-                failed += 1;
-                logging::warn(format!("Wallet execution failed: {error}"));
-            }
+    succeeded += 1;
+    logging::success(format!("Wallet mint and forwarding completed: {address}"));
+    crate::telegram::TelegramNotifier::from_env()
+        .notify_minted(&metadata.slug, &format!("{address}"), "pending", 1, chain.chain_id)
+        .await;
+}
+Err(error) => {
+    failed += 1;
+    let reason = format!("{error}");
+    logging::warn(format!("Wallet execution failed: {reason}"));
+    crate::telegram::TelegramNotifier::from_env()
+        .notify_failed(&metadata.slug, "unknown", &reason)
+        .await;
+}
         }
     }
     logging::info(format!(
@@ -1825,7 +1838,10 @@ async fn wait_for_launch_wake(
         let refresh_wait = Duration::from_secs(config.scheduling.refresh_interval_seconds);
         let wake_wait = Duration::from_millis(wake_at_ms.saturating_sub(now_ms));
         let wait = wake_wait.min(refresh_wait);
-        logging::countdown_until(phase.starts_at(), wait).await;
+                crate::telegram::TelegramNotifier::from_env()
+            .notify_scheduled("collection", "scheduled phase", &phase.starts_at().to_string())
+            .await;
+logging::countdown_until(phase.starts_at(), wait).await;
         if wait == wake_wait {
             continue;
         }
