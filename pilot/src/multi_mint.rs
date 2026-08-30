@@ -1469,8 +1469,15 @@ async fn run_self_funded(
     succeeded += 1;
     logging::success(format!("Wallet mint and forwarding completed: {address}"));
     crate::telegram::TelegramNotifier::from_env()
-        .notify_minted(&metadata.slug, &format!("{address}"), "pending", 1, chain.chain_id)
-        .await;
+    .notify_minted(
+        &metadata.slug,
+        &format!("{address}"),
+        "pending",
+        1,
+        0.0,
+        chain.chain_id,
+    )
+    .await;
 }
 Err(error) => {
     failed += 1;
