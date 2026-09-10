@@ -887,7 +887,8 @@ async fn mint(config: &AppConfig, signer: &WalletSigner) -> Result<(), CommandEr
     let locator = parse_collection_locator(&locator_text)?;
     logging::section_break();
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
+    let probe =
+        logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = derived_chain(config, probe.chain_id);
     logging::success(format!("RPC connected: chain_id={}", chain.chain_id));
     let mut client = WalletOpenSeaClient::new(&config.opensea)?;

@@ -44,10 +44,7 @@ impl TelegramNotifier {
         if !self.enabled {
             return;
         }
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
         let _ = self
             .client
             .post(&url)
@@ -61,14 +58,14 @@ impl TelegramNotifier {
     }
 
     async fn fetch_floor_price(&self, slug: &str) -> Option<f64> {
-        let url = format!(
-            "https://api.opensea.io/api/v2/collections/{}/stats",
-            slug
-        );
+        let url = format!("https://api.opensea.io/api/v2/collections/{}/stats", slug);
         let resp = self
             .client
             .get(&url)
-            .header("x-api-key", std::env::var("OPENSEA_API_KEY").unwrap_or_default())
+            .header(
+                "x-api-key",
+                std::env::var("OPENSEA_API_KEY").unwrap_or_default(),
+            )
             .send()
             .await
             .ok()?;
@@ -77,14 +74,14 @@ impl TelegramNotifier {
     }
 
     async fn fetch_collection_name(&self, slug: &str) -> Option<String> {
-        let url = format!(
-            "https://api.opensea.io/api/v2/collections/{}",
-            slug
-        );
+        let url = format!("https://api.opensea.io/api/v2/collections/{}", slug);
         let resp = self
             .client
             .get(&url)
-            .header("x-api-key", std::env::var("OPENSEA_API_KEY").unwrap_or_default())
+            .header(
+                "x-api-key",
+                std::env::var("OPENSEA_API_KEY").unwrap_or_default(),
+            )
             .send()
             .await
             .ok()?;
@@ -115,7 +112,9 @@ impl TelegramNotifier {
 
         // Fetch floor price and collection name
         let floor = self.fetch_floor_price(slug).await.unwrap_or(0.0);
-        let name = self.fetch_collection_name(slug).await
+        let name = self
+            .fetch_collection_name(slug)
+            .await
             .unwrap_or_else(|| slug.to_string());
 
         // Calculate PnL

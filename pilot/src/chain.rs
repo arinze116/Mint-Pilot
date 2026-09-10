@@ -85,13 +85,14 @@ impl ChainGateway {
         let mut last_error = ChainError::InvalidResponse { index: 1 };
         for (i, url) in rpc_urls.iter().enumerate() {
             match self.probe_rpc(url).await {
-                Ok(probe) => {
+                Ok(mut probe) => {
                     if i > 0 {
                         logging::warn(format!(
                             "Primary RPC failed at startup; using fallback RPC {}.",
                             i + 1
                         ));
                     }
+                    probe.rpc_index = i + 1;
                     return Ok(probe);
                 }
                 Err(e) => {
@@ -116,12 +117,7 @@ impl ChainGateway {
         let clock_offset_ms = {
             let local_before = system_time_ms();
             let block_result = self
-                .request::<RpcBlock>(
-                    rpc_url,
-                    1,
-                    "eth_getBlockByNumber",
-                    json!(["latest", false]),
-                )
+                .request::<RpcBlock>(rpc_url, 1, "eth_getBlockByNumber", json!(["latest", false]))
                 .await;
             let local_after = system_time_ms();
             match block_result {
@@ -442,8 +438,7 @@ impl ChainGateway {
         signed: &SignedTransaction,
     ) -> Result<B256, ChainError> {
         let expected_hash = signed.hash();
-        let encoded: std::sync::Arc<str> =
-            format!("0x{}", hex::encode(signed.raw())).into();
+        let encoded: std::sync::Arc<str> = format!("0x{}", hex::encode(signed.raw())).into();
         let mut tasks = tokio::task::JoinSet::new();
         for (i, url) in config.rpc_urls.iter().cloned().enumerate() {
             let client = self.client.clone();
@@ -570,8 +565,7 @@ impl ChainGateway {
                 return if received_response {
                     Ok(None)
                 } else {
-                    Err(last_rate_limit
-                        .unwrap_or(ChainError::InvalidResponse { index: rpc_index }))
+                    Err(last_rate_limit.unwrap_or(ChainError::InvalidResponse { index: rpc_index }))
                 };
             }
             sleep(Duration::from_millis(delay_ms).min(deadline - now)).await;

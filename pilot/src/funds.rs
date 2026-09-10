@@ -917,10 +917,10 @@ async fn connect(
     config: &AppConfig,
 ) -> Result<(ChainGateway, ChainConfig, usize), NativeFundsError> {
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-let probe = rpc_read_retry(config, || gateway.probe_any_rpc(&config.rpc_urls)).await?;
+    let probe = rpc_read_retry(config, || gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = ChainConfig {
         chain_id: probe.chain_id,
-rpc_urls: config.rpc_urls.clone(),
+        rpc_urls: config.rpc_urls.clone(),
     };
     logging::success(format!("RPC connected: chain_id={}", chain.chain_id));
     Ok((gateway, chain, probe.rpc_index))
@@ -1437,6 +1437,7 @@ mod tests {
             fees: FeesConfig {
                 mode: crate::config::FeeMode::Automatic,
                 replacement_bump_bps: 11_250,
+                launch_priority_fee_multiplier_bps: 10_000,
             },
             rpc_urls: vec!["https://rpc.example.invalid".parse().expect("RPC URL")],
             gas_limit: 300_000,

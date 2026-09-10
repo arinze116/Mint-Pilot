@@ -248,10 +248,10 @@ impl LoadedConfig {
         for key in ["RPC_URL_2", "RPC_URL_3", "RPC_URL_4", "RPC_URL_5"] {
             if let Some(raw) = values.remove(key) {
                 if !raw.trim().is_empty() {
-                    let url = parse_url(&raw, "RPC_URL_N")?;
+                    let url = parse_url(&raw, key)?;
                     if !is_allowed_rpc_url(&url) {
                         return Err(invalid(
-                            "RPC_URL",
+                            key,
                             "must use HTTPS, except for an HTTP loopback test endpoint",
                         ));
                     }
@@ -453,7 +453,7 @@ fn parse_fees(values: &mut BTreeMap<String, String>) -> Result<FeesConfig, Confi
         }
     };
     let launch_priority_fee_multiplier_bps =
-                take_u32_default(values, "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS", 10_000)?;
+        take_u32_default(values, "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS", 10_000)?;
     Ok(FeesConfig {
         mode,
         replacement_bump_bps,
@@ -493,6 +493,11 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_opensea()?;
         self.validate_scheduling()?;
+        if self.rpc_urls.is_empty() {
+            return Err(ConfigError::Validation(
+                "at least one RPC URL must be configured".into(),
+            ));
+        }
         if self.gas_limit == 0 {
             return Err(ConfigError::Validation(
                 "GAS_LIMIT must be greater than zero".into(),
@@ -860,9 +865,9 @@ mod tests {
                 let line = line.strip_prefix('#').unwrap_or(line).trim_start();
                 let (name, _) = line.split_once('=')?;
                 (!name.is_empty()
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte == b'_'))
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    }))
                 .then_some(name)
             })
             .collect::<HashSet<_>>();
@@ -923,6 +928,10 @@ mod tests {
                 "SPONSORED_OPERATION_DEADLINE_SECONDS",
                 &["`120`", "`30-3600`"] as &[&str],
             ),
+            (
+                "LAUNCH_PRIORITY_FEE_MULTIPLIER_BPS",
+                &["`10000`", "`10000-50000`"] as &[&str],
+            ),
         ];
 
         for (setting, expected_values) in expected_rows {
@@ -964,6 +973,7 @@ mod tests {
         assert_eq!(loaded.app.retry.base_delay_ms, 250);
         assert_eq!(loaded.app.retry.max_delay_ms, 2_000);
         assert_eq!(loaded.app.fees.replacement_bump_bps, 11_250);
+        assert_eq!(loaded.app.fees.launch_priority_fee_multiplier_bps, 10_000);
         assert_eq!(loaded.app.opensea.request_timeout_ms, 10_000);
         assert_eq!(loaded.app.opensea.eligibility_request_timeout_ms, 5_000);
         assert_eq!(loaded.app.opensea.max_attempts, 3);

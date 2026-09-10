@@ -222,7 +222,8 @@ pub async fn run(
     let locator_text = terminal::prompt_collection_locator()?;
     let locator = parse_collection_locator(&locator_text)?;
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
+    let probe =
+        logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = ChainConfig {
         chain_id: probe.chain_id,
         rpc_urls: config.rpc_urls.clone(),
@@ -287,9 +288,13 @@ pub async fn run(
     logging::info(format!(
         "Clock offset vs chain: {} ms ({}).",
         probe.clock_offset_ms,
-        if probe.clock_offset_ms > 0 { "local ahead" }
-        else if probe.clock_offset_ms < 0 { "local behind" }
-        else { "aligned" }
+        if probe.clock_offset_ms > 0 {
+            "local ahead"
+        } else if probe.clock_offset_ms < 0 {
+            "local behind"
+        } else {
+            "aligned"
+        }
     ));
     let context = MultiRunContext {
         config,
@@ -600,7 +605,8 @@ pub async fn inspect_calldata(
     let manifest = WalletManifest::load(manifest_path)?;
     let locator = parse_collection_locator(locator_text)?;
     let gateway = ChainGateway::new(Duration::from_millis(config.opensea.request_timeout_ms))?;
-    let probe = logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
+    let probe =
+        logging::animate("Connecting to RPC", gateway.probe_any_rpc(&config.rpc_urls)).await?;
     let chain = ChainConfig {
         chain_id: probe.chain_id,
         rpc_urls: config.rpc_urls.clone(),
@@ -1466,27 +1472,27 @@ async fn run_self_funded(
     while let Some(result) = tasks.join_next().await {
         match result.map_err(|_| MultiMintError::Worker)? {
             Ok(address) => {
-    succeeded += 1;
-    logging::success(format!("Wallet mint and forwarding completed: {address}"));
-    crate::telegram::TelegramNotifier::from_env()
-    .notify_minted(
-        &metadata.slug,
-        &format!("{address}"),
-        "pending",
-        1,
-        0.0,
-        chain.chain_id,
-    )
-    .await;
-}
-Err(error) => {
-    failed += 1;
-    let reason = format!("{error}");
-    logging::warn(format!("Wallet execution failed: {reason}"));
-    crate::telegram::TelegramNotifier::from_env()
-        .notify_failed(&metadata.slug, "unknown", &reason)
-        .await;
-}
+                succeeded += 1;
+                logging::success(format!("Wallet mint and forwarding completed: {address}"));
+                crate::telegram::TelegramNotifier::from_env()
+                    .notify_minted(
+                        &metadata.slug,
+                        &format!("{address}"),
+                        "pending",
+                        1,
+                        0.0,
+                        chain.chain_id,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                failed += 1;
+                let reason = format!("{error}");
+                logging::warn(format!("Wallet execution failed: {reason}"));
+                crate::telegram::TelegramNotifier::from_env()
+                    .notify_failed(&metadata.slug, "unknown", &reason)
+                    .await;
+            }
         }
     }
     logging::info(format!(
@@ -1845,10 +1851,14 @@ async fn wait_for_launch_wake(
         let refresh_wait = Duration::from_secs(config.scheduling.refresh_interval_seconds);
         let wake_wait = Duration::from_millis(wake_at_ms.saturating_sub(now_ms));
         let wait = wake_wait.min(refresh_wait);
-                crate::telegram::TelegramNotifier::from_env()
-            .notify_scheduled("collection", "scheduled phase", &phase.starts_at().to_string())
+        crate::telegram::TelegramNotifier::from_env()
+            .notify_scheduled(
+                "collection",
+                "scheduled phase",
+                &phase.starts_at().to_string(),
+            )
             .await;
-logging::countdown_until(phase.starts_at(), wait).await;
+        logging::countdown_until(phase.starts_at(), wait).await;
         if wait == wake_wait {
             continue;
         }
@@ -1900,15 +1910,12 @@ async fn refresh_hot_fees(
             if launch_priority_multiplier_bps > 10_000 {
                 let boosted_priority = fresh
                     .max_priority_fee_per_gas
-                    .saturating_mul(alloy_primitives::U256::from(
-                        launch_priority_multiplier_bps,
-                    ))
+                    .saturating_mul(alloy_primitives::U256::from(launch_priority_multiplier_bps))
                     / alloy_primitives::U256::from(10_000_u32);
                 let priority_increase =
                     boosted_priority.saturating_sub(fresh.max_priority_fee_per_gas);
                 fresh.max_priority_fee_per_gas = boosted_priority;
-                fresh.max_fee_per_gas =
-                    fresh.max_fee_per_gas.saturating_add(priority_increase);
+                fresh.max_fee_per_gas = fresh.max_fee_per_gas.saturating_add(priority_increase);
             }
             for action in &mut actions {
                 action.fee_estimate = fresh;

@@ -2325,6 +2325,7 @@ mod tests {
         for error in [
             OpenSeaError::Transport,
             OpenSeaError::RateLimited,
+            OpenSeaError::MintWalletIneligible,
             OpenSeaError::Http(408),
             OpenSeaError::Http(429),
             OpenSeaError::Http(503),
@@ -2337,7 +2338,6 @@ mod tests {
             OpenSeaError::Compatibility,
             OpenSeaError::InvalidNonceResponse,
             OpenSeaError::AuthenticationSessionMismatch,
-            OpenSeaError::MintWalletIneligible,
             OpenSeaError::UnsafeMintAction { reason: "test" },
         ] {
             assert!(!is_retryable_request_error(&error), "{error}");

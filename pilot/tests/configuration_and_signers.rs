@@ -35,7 +35,10 @@ fn load_source(source: &str) -> Result<LoadedConfig, opensea_mint::config::Confi
 fn parses_and_validates_a_complete_env_only_config() {
     let loaded = load_source(&valid_environment()).expect("valid config");
 
-    assert_eq!(loaded.app.rpc_url.as_str(), "https://rpc.example.invalid/");
+    assert_eq!(
+        loaded.app.primary_rpc_url().as_str(),
+        "https://rpc.example.invalid/"
+    );
     assert_eq!(loaded.app.retry.max_attempts, 3);
     assert_eq!(loaded.app.scheduling.refresh_interval_seconds, 600);
     assert!(matches!(loaded.app.fees.mode, FeeMode::Automatic));
