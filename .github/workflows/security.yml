@@ -1,0 +1,36 @@
+name: Security and correctness checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust unit and integration tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pilot
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run locked Rust test suite
+        run: cargo test --locked --all-targets
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+  contracts:
+    name: Foundry contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Run Solidity tests and configured fuzz cases
+        working-directory: pilot
+        run: forge test --fuzz-runs 1000 -vvv
